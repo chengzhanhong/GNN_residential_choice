@@ -375,22 +375,63 @@ def get_criteria(target, log_pred, comm):
 
 def get_elasticity(model, x, i):
     # Calculate the elasticity of the i-th alternative with respect to its features
+    model.zero_grad()
     x.requires_grad = True
     y = model(x.unsqueeze(0)).exp().squeeze()[i]  # (num_comm,)
     d = torch.autograd.grad(y, x, grad_outputs=torch.ones_like(y))[
         0
     ]  # (num_comm, num_features)
     elasticity = d[i] * x[i] / y
+    model.zero_grad()
+    x.grad = None
+    x.requires_grad = False
     return elasticity
 
 
 def get_cross_elasticity(model, x, i, j):
     # Calculate the cross elasticity of the i-th alternative with respect to changes in the j-th alternative
     # x in (num_comm, num_features)
+    model.zero_grad()
     x.requires_grad = True  # Enable differentiation
     y = model(x.unsqueeze(0)).exp().squeeze()[i]  # (num_comm,)
     d = torch.autograd.grad(y, x, grad_outputs=torch.ones_like(y))[
         0
     ]  # (num_comm, num_features)
     elasticity = d[j] * x[j] / y
+    model.zero_grad()
+    # zero grad x
+    x.grad = None
+    x.requires_grad = False
     return elasticity
+
+
+def find_neighbors(edge_index, node_id):
+    """Find the neighbors of a given node in the graph.
+    edge_index:
+        The edge index matrix (n x 2) of the graph.
+    node_id: int
+    """
+    neighbors = []
+    for i in range(edge_index.shape[1]):
+        if edge_index[0][i] == node_id:
+            if type(edge_index[1][i]) == torch.Tensor:
+                neighbors.append(edge_index[1][i].item())
+            else:
+                neighbors.append(edge_index[1][i])
+    return neighbors
+
+
+def find_k_hop_neighbors(edge_index, node_id, k):
+    """Find the k-hop neighbors of a given node in the graph.
+    edge_index:
+        The edge index matrix (n x 2) of the graph.
+    node_id: int
+    k: int
+    """
+    neighbors = [node_id]
+    for _ in range(k):
+        new_neighbors = []
+        for n in neighbors:
+            new_neighbors.extend(find_neighbors(edge_index, n))
+        neighbors = list(set(new_neighbors))
+    return neighbors
