@@ -255,20 +255,21 @@ def train(model, criterion, train_loader, val_loader, test_loader, config, devic
     else:
         torch.save(model.state_dict(), f"log/{run.name}.pth")
 
-    model.eval()
-    test_loss = []
-    with torch.no_grad():
-        test_loss = 0.0
-        for inputs, target, in test_loader:
-            inputs = [input.to(device) for input in inputs] if isinstance(inputs, list) else inputs.to(device)
-            target = target.to(device)
-            output = model(*inputs) if isinstance(inputs, list) else model(inputs)
-            loss = criterion(output, target)
-            test_loss += loss.item()
-        test_loss /= len(test_loader)
-    if verbose:
-        print(f"Test Loss: {test_loss:.4f}")
-    wandb.log({"test_loss": test_loss})
+    if test_loader is not None:
+        model.eval()
+        test_loss = []
+        with torch.no_grad():
+            test_loss = 0.0
+            for inputs, target, in test_loader:
+                inputs = [input.to(device) for input in inputs] if isinstance(inputs, list) else inputs.to(device)
+                target = target.to(device)
+                output = model(*inputs) if isinstance(inputs, list) else model(inputs)
+                loss = criterion(output, target)
+                test_loss += loss.item()
+            test_loss /= len(test_loader)
+        if verbose:
+            print(f"Test Loss: {test_loss:.4f}")
+        wandb.log({"test_loss": test_loss})
     wandb.finish()
     return model
 
