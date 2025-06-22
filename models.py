@@ -198,86 +198,33 @@ class GAT(nn.Module):
 
 class GNNChoiceModel(nn.Module):
     def __init__(
-        self, num_comm_features, num_hidden, edge_index, dropout=0.1, heads=1, **kwargs
+        self, num_features, num_hidden, edge_index, dropout=0.1, heads=1, n_layer=2, **kwargs
     ):
         """
-        GNN-based residential location choice model
+        GNN-based residential location choice model (specifically GAT).
         """
         super(GNNChoiceModel, self).__init__()
-        self.gnn = GAT(num_comm_features, num_hidden, dropout, heads, **kwargs)
+        self.gnn = GAT(num_features, num_hidden, dropout, heads, n_layer=n_layer, **kwargs)
         self.register_buffer("edge_index", edge_index)  # Constant buffer
         self.num_hidden = num_hidden
         self.out_layer = nn.Linear(num_hidden, 1)
 
-    def forward(self, comm_data):
+    def forward(self, data):
         """
-        hh_data: (bs, num_hh_features)
-        comm_data: (bs, num_comm, num_comm_features)
+        data: (bs, num_class, num_features)
         edge_index: (bs, 2, num_edges)
         """
         # Batch over the community graphs
-        # (bs, num_comm, num_comm_features) -> (bs, num_comm, num_hidden)
+        # (bs, num_class, num_features) -> (bs, num_class, num_hidden)
         comm_embedding = torch.zeros(
-            comm_data.size(0), comm_data.size(1), self.num_hidden
-        ).to(comm_data.device)
-        for i in range(comm_data.size(0)):
-            comm_embedding[i] = self.gnn(comm_data[i], self.edge_index)
+            data.size(0), data.size(1), self.num_hidden
+        ).to(data.device)
+        for i in range(data.size(0)):
+            comm_embedding[i] = self.gnn(data[i], self.edge_index)
 
-        out = self.out_layer(comm_embedding).squeeze()  # (bs, num_comm)
+        out = self.out_layer(comm_embedding).squeeze()  # (bs, num_class)
 
-        return F.log_softmax(out, dim=-1)  # (batch_size, num_comm)
-
-
-# class GAT(nn.Module):
-#     def __init__(self, num_features, num_hidden, dropout=0.1, heads=1, **kwargs):
-#         super(GAT, self).__init__()
-#         self.conv1 = GATConv(num_features, num_hidden // heads, heads=heads, **kwargs)
-#         self.conv2 = GATConv(num_hidden, num_hidden // heads, heads=heads, **kwargs)
-#         self.drop = nn.Dropout(dropout)
-
-#     def forward(self, x, edge_index):
-#         x = self.conv1(x, edge_index).relu()
-#         x = self.drop(x)
-#         x = self.conv2(x, edge_index)
-#         return x
-
-#     def forward_with_weights(self, x, edge_index):
-#         x = self.conv1(x, edge_index).relu()
-#         x = self.drop(x)
-#         x, weights = self.conv2(x, edge_index, return_attention_weights=True)
-#         return x, weights
-
-
-# class GNNChoiceModel(nn.Module):
-#     def __init__(
-#         self, num_comm_features, num_hidden, edge_index, dropout=0.1, heads=1, **kwargs
-#     ):
-#         """
-#         GNN-based residential location choice model
-#         """
-#         super(GNNChoiceModel, self).__init__()
-#         self.gnn = GAT(num_comm_features, num_hidden, dropout, heads, **kwargs)
-#         self.register_buffer("edge_index", edge_index)  # Constant buffer
-#         self.num_hidden = num_hidden
-#         self.out_layer = nn.Linear(num_hidden, 1)
-
-#     def forward(self, comm_data):
-#         """
-#         hh_data: (bs, num_hh_features)
-#         comm_data: (bs, num_comm, num_comm_features)
-#         edge_index: (bs, 2, num_edges)
-#         """
-#         # Batch over the community graphs
-#         # (bs, num_comm, num_comm_features) -> (bs, num_comm, num_hidden)
-#         comm_embedding = torch.zeros(
-#             comm_data.size(0), comm_data.size(1), self.num_hidden
-#         ).to(comm_data.device)
-#         for i in range(comm_data.size(0)):
-#             comm_embedding[i] = self.gnn(comm_data[i], self.edge_index)
-
-#         out = self.out_layer(comm_embedding.relu()).squeeze()  # (bs, num_comm)
-
-#         return F.log_softmax(out, dim=-1)  # (batch_size, num_comm)
+        return F.log_softmax(out, dim=-1)  # (batch_size, num_class)
 
 
 class MLP_Choice(nn.Module):
@@ -298,4 +245,145 @@ class MLP_Choice(nn.Module):
         x = self.fc2(x).squeeze()  # (batch_size, num_comm, 1)
         return F.log_softmax(x, dim=-1)  # (batch_size, num_comm)
 
-# %%
+
+# -----------------------------------------------------------------------------------------------------
+# Graph Convolutional neural network model with different types of aggregation functions
+# For historical reasons, the current GCNConv and GATConv have different interfaces. We may combine them in the future.
+# -----------------------------------------------------------------------------------------------------
+from torch_geometric.utils import add_self_loops, degree
+from torch_geometric.nn import MessagePassing
+from torch_geometric.nn.aggr import Aggregation
+
+
+class LogSumExpAggregation(Aggregation):
+    """An aggregation operator that computes the log-sum-exp (LSE) of features across a set of elements.
+    LSE is not a standard aggregation function like sum or mean, so we implement it as a custom aggregation class.
+    LSE is computed in a numerically stable way (log-sum-exp trick) to avoid overflow/underflow issues:
+
+    .. math::
+        \text{LSE}(x_1, \dots, x_n) = \max(x) + \log\left( \sum_i \exp(x_i - \max(x)) \right)
+    """
+    def forward(self, x, index, **kwargs):
+        # x: [num_edges, F]
+        # index: [num_edges] or None
+        # The maximum value of each group
+        out = self.reduce(x, index, reduce="max", **kwargs)
+        shifted = x - out[index]
+        # Sum exp(shifted)
+        exp_sum = self.reduce(shifted.exp(), index, reduce="sum", **kwargs)
+        # Final log-sum-exp
+        lse = out + torch.log(exp_sum + 1e-10)
+        return lse
+
+
+class GCNConv(MessagePassing):
+    def __init__(self, in_dims, out_dims, aggr="add", norm=False):
+        """
+        Graph Convolutional Network (GCN) layer with different aggregation functions.
+        Args:
+            aggr: Aggregation function to use: 'add', 'mean', 'max', 'lse'(Log-Sum-Exp).
+            norm: Whether to normalize the node features.
+        """
+        # If using lse aggregation, we need to use the custom aggregation class.
+        if aggr == "lse":
+            aggr = LogSumExpAggregation()
+        super().__init__(aggr=aggr)  # aggregation.
+        self.lin = nn.Linear(in_dims, out_dims, bias=False)
+        self.bias = nn.Parameter(torch.empty(out_dims))
+        self.norm = norm  # Whether to normalize the node features.
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.lin.reset_parameters()
+        self.bias.data.zero_()
+
+    def forward(self, x, edge_index):
+        # x has shape [N, in_dims]
+        # edge_index has shape [2, E]
+
+        # Add self-loops to the adjacency matrix.
+        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+
+        # Linearly transform node feature matrix.
+        x = self.lin(x)
+
+        # If compute normalization.
+        if self.norm:
+            row, col = edge_index
+            deg = degree(col, x.size(0), dtype=x.dtype)
+            deg_inv_sqrt = deg.pow(-0.5)
+            deg_inv_sqrt[deg_inv_sqrt == float("inf")] = 0
+            norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+        else:  # No normalization
+            norm = torch.ones(edge_index.size(1), dtype=x.dtype, device=x.device)
+
+        # Start propagating messages.
+        out = self.propagate(edge_index, x=x, norm=norm)
+
+        # Apply a final bias vector.
+        out = out + self.bias
+
+        return out
+
+    def message(self, x_j, norm):
+        # x_j has shape [E, out_dims]
+
+        # Normalize node features.
+        return norm.view(-1, 1) * x_j
+
+
+class GCN(nn.Module):
+    """
+    Includes multiple GCNConv layers with ReLU activation and dropout.
+    """
+    def __init__(
+        self, num_features, num_hidden, dropout=0.1, aggr="add", norm=False, n_layer=2
+    ):
+        super(GCN, self).__init__()
+        self.convs = nn.ModuleList()
+        self.convs.append(
+            GCNConv(num_features, num_hidden, aggr, norm)
+        )
+        for _ in range(n_layer - 1):
+            self.convs.append(
+                GCNConv(num_hidden, num_hidden, aggr, norm)
+            )
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, edge_index):
+        for conv in self.convs:
+            x = conv(x, edge_index).relu()
+            x = self.drop(x)
+        return x
+
+
+class GCNChoiceModel(nn.Module):
+    def __init__(
+        self, num_features, num_hidden, edge_index, dropout=0.1, aggr="add", n_layer=2, norm=False
+    ):
+        """
+        GCN-based residential location choice model.
+        """
+        super(GCNChoiceModel, self).__init__()
+        self.gnn = GCN(num_features, num_hidden, dropout, aggr=aggr, n_layer=n_layer, norm=norm)
+        self.register_buffer("edge_index", edge_index)  # Constant buffer
+        self.num_hidden = num_hidden
+        self.out_layer = nn.Linear(num_hidden, 1)
+
+    def forward(self, data):
+        """
+        data: (bs, num_class, num_features)
+        edge_index: (bs, 2, num_edges)
+        """
+        # Batch over the community graphs
+        # (bs, num_class, num_features) -> (bs, num_class, num_hidden)
+        comm_embedding = torch.zeros(data.size(0), data.size(1), self.num_hidden).to(
+            data.device
+        )
+        for i in range(data.size(0)):
+            comm_embedding[i] = self.gnn(data[i], self.edge_index)
+
+        out = self.out_layer(comm_embedding).squeeze()  # (bs, num_class)
+
+        return F.log_softmax(out, dim=-1)  # (batch_size, num_class)
