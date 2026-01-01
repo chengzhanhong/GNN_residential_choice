@@ -12,7 +12,7 @@ from sklearn.metrics import top_k_accuracy_score
 
 class Config(object):
     def __init__(self, **kwargs):
-        self.project_name = "Deepchoice"
+        self.project_name = "GNN_residential_choice"
         self.optimizer = "adam"  # one of [adam, sgd]
         self.lr = 0.001
         self.lr_scheduler = "one_cycle"  # one of [step, one_cycle, exp, none]
@@ -110,7 +110,7 @@ def haversine_np(lat1, lon1, lat2, lon2):
     return distance
 
 
-def train(model, criterion, train_loader, val_loader, test_loader, config, device, verbose=True):
+def train(model, criterion, train_loader, val_loader, test_loader, config, device, verbose=True, **kwargs):
     """
     The standard procedure for model training
     """
@@ -199,17 +199,16 @@ def train(model, criterion, train_loader, val_loader, test_loader, config, devic
                 optimizer.step()
 
             train_loss += loss.item()
-
             if scheduler is not None:
                 scheduler.step()
-            if verbose:
-                if (i % 100 == 0) and (i > 0):
-                    print(
-                        f"Epoch [{epoch}/{config.n_epoch}], Step [{i}/{len(train_loader)}], Loss: {loss.item():.4f}"
-                        f"\t total time: {time.time() - start_time:.2f}"
-                    )
 
         epoch_loss.append(train_loss / len(train_loader))
+        wandb.log({"train_loss": epoch_loss[-1]}, step=epoch)
+        if verbose:
+            print(
+                f"Epoch [{epoch}/{config.n_epoch}], Loss: {epoch_loss[-1]:.4f}"
+                f"\t total time: {time.time() - start_time:.2f}"
+            )
 
         # Calculate validation loss
         if val_loader is not None:
@@ -229,13 +228,7 @@ def train(model, criterion, train_loader, val_loader, test_loader, config, devic
                 )
 
             best_val_loss = min(best_val_loss, val_loss)
-            wandb.log(
-                {
-                    "train_loss": epoch_loss[-1],
-                    "val_loss": np.mean(val_loss),
-                    "epoch": epoch,
-                }
-            )
+            wandb.log({"val_loss": np.mean(val_loss)}, step=epoch)
 
             # Save the current best model
             if val_loss == best_val_loss:
@@ -254,22 +247,21 @@ def train(model, criterion, train_loader, val_loader, test_loader, config, devic
         model.load_state_dict(torch.load(f"log/{run.name}.pth"))
     else:
         torch.save(model.state_dict(), f"log/{run.name}.pth")
+        pass
+
+    train_results = evaluate_nn(model, train_loader, kwargs.get("comm", None))
+    train_results = {f"train_{key}": value for key, value in train_results.items()}
+    wandb.log(train_results)
+    if verbose:
+        print(f"Train results: {train_results}")
 
     if test_loader is not None:
-        model.eval()
-        test_loss = []
-        with torch.no_grad():
-            test_loss = 0.0
-            for inputs, target, in test_loader:
-                inputs = [input.to(device) for input in inputs] if isinstance(inputs, list) else inputs.to(device)
-                target = target.to(device)
-                output = model(*inputs) if isinstance(inputs, list) else model(inputs)
-                loss = criterion(output, target)
-                test_loss += loss.item()
-            test_loss /= len(test_loader)
+        test_results = evaluate_nn(model, test_loader, kwargs.get("comm", None))
+        test_results = {f"test_{key}": value for key, value in test_results.items()}
+        wandb.log(test_results)
         if verbose:
-            print(f"Test Loss: {test_loss:.4f}")
-        wandb.log({"test_loss": test_loss})
+            print(f"Test results: {test_results}")
+
     wandb.finish()
     return model
 
